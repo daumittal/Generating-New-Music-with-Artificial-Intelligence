@@ -1,0 +1,172 @@
+name: CI
+
+permissions:
+  actions: read
+  checks: read
+  contents: write
+  deployments: read
+  id-token: write
+  issues: write
+  packages: read
+  pages: read
+  pull-requests: write
+  repository-projects: read
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          components: clippy
+      - run: cargo clippy
+
+  unit-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest] # macos-latest TODO: backend::audio_generation_backend::tests::handles_job_cancellation and backend::server::tests::can_abort_a_job are timing out
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo test
+
+  smoke-test:
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo run --release -- 'Create a LoFi song' --secs 1 --model small-quant --no-interactive --no-playback
+
+  tag:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs:
+      - unit-test
+      - clippy
+      - smoke-test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: '0' # https://github.com/actions/checkout/issues/217
+
+      - uses: ./.github/actions/setup
+      - run: cargo install cargo-release
+      - run: cargo release version $(.github/semver.sh) -x --no-confirm
+      - name: Tag
+        id: tag
+        run: |
+          version=`grep '^version = ' Cargo.toml | sed 's/version = //; s/\"//; s/\"//'`
+          git config user.name github-actions
+          git config user.email github-actions@github.com 
+          git add .
+          git commit -m "ci: v$version"
+          git tag "v$version"
+          git push
+          git push --tags
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - run: gh release create "v${{ steps.tag.outputs.version }}"
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+
+  cargo-release:
+    needs: tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  docker-release:
+    needs: tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v2
+      - uses: docker/setup-buildx-action@v2
+      - uses: docker/login-action@v2
+        with:
+          username: gabotechs
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+      - uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          tags: gabotechs/musicgpt:${{ needs.tag.outputs.version }},gabotechs/musicgpt:latest
+
+  homebrew-release:
+    needs: tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: gabotechs/homebrew-taps
+          token: ${{ secrets.CI_TOKEN }}
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+      - run: sed "s/<version>/${{ needs.tag.outputs.version }}/g" repo/.github/musicgpt.rb > musicgpt.rb
+      - run: |
+          git add musicgpt.rb
+          git config user.name github-actions
+          git config user.email github-actions@github.com 
+          git commit -m "Brew formula update for musicgpt version v${{ needs.tag.outputs.version }}"
+          git push
+
+  upload:
+    needs: tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: cuda
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            features: coreml
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            features: coreml
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: default
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+      - run: ./.github/bundle-release.sh ${{ matrix.target }}
+        shell: bash
+      - run: gh release upload v${{ needs.tag.outputs.version }} ${{ matrix.target }}.tar.gz
