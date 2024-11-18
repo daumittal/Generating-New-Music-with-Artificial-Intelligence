@@ -8,14 +8,5 @@ Lastly, we'll compare and analyze outputs generated from different prompts, prov
 
 
 
-torchaudio: This library will be used for audio processing.
+<img width="580" alt="image" src="https://github.com/user-attachments/assets/f1175f97-f656-4be9-8ecf-e04e65e2d05d">
 
-audiocraft: This library will provide music generation models.
-
-MusicGen from audiocraft.models: This model will generate music as per the given prompt.
-
-Audio from IPython.display: This module will display the audio output.
-
-Textarea from ipywidgets: This module will be used to display a text area similar to HTML.
-
-Button from ipywidgets: This module will be used to display a button similar to HTML.
